@@ -51,8 +51,6 @@
 
 QT_BEGIN_NAMESPACE
 
-const int PeriodTimeMs = 20;
-const int LowLatencyPeriodTimeMs = 10;
 const int LowLatencyBufferSizeMs = 40;
 
 #define LOW_LATENCY_CATEGORY_NAME "game"
@@ -170,6 +168,7 @@ QPulseAudioOutput::QPulseAudioOutput(const QByteArray &device)
     , m_resuming(false)
     , m_volume(1.0)
 {
+    m_tickTimer->setTimerType(Qt::PreciseTimer);
     connect(m_tickTimer, SIGNAL(timeout()), SLOT(userFeed()));
 }
 
@@ -356,7 +355,7 @@ bool QPulseAudioOutput::open()
     requestedBuffer.maxlength = (uint32_t)-1;
     requestedBuffer.minreq = (uint32_t)-1;
     requestedBuffer.prebuf = (uint32_t)-1;
-    requestedBuffer.tlength = m_bufferSize;
+    requestedBuffer.tlength = m_bufferSize * 2;
 
     if (pa_stream_connect_playback(m_stream, m_device.data(), (m_bufferSize > 0) ? &requestedBuffer : NULL, (pa_stream_flags_t)0, NULL, NULL) < 0) {
         qWarning() << "pa_stream_connect_playback() failed!";
@@ -373,11 +372,15 @@ bool QPulseAudioOutput::open()
         pa_threaded_mainloop_wait(pulseEngine->mainloop());
 
     const pa_buffer_attr *buffer = pa_stream_get_buffer_attr(m_stream);
-    m_periodTime = (m_category == LOW_LATENCY_CATEGORY_NAME) ? LowLatencyPeriodTimeMs : PeriodTimeMs;
-    m_periodSize = pa_usec_to_bytes(m_periodTime*1000, &m_spec);
-    m_bufferSize = buffer->tlength;
-    m_maxBufferSize = buffer->maxlength;
-    m_audioBuffer = new char[m_maxBufferSize];
+    if(!m_bufferSize){
+        m_bufferSize = buffer->tlength;
+    }
+    m_periodSize = m_bufferSize;
+    m_periodTime = pa_bytes_to_usec(m_periodSize, &m_spec) / 2000;
+    if(m_pullMode){
+        m_maxBufferSize = buffer->maxlength;
+        m_audioBuffer = new char[m_maxBufferSize];
+    }
 
     const qint64 streamSize = m_audioSource ? m_audioSource->size() : 0;
     if (m_pullMode && streamSize > 0 && static_cast<qint64>(buffer->prebuf) > streamSize) {
@@ -464,30 +467,11 @@ void QPulseAudioOutput::userFeed()
 
     if (m_pullMode) {
         int writableSize = bytesFree();
-        int chunks = writableSize / m_periodSize;
-        if (chunks == 0)
-            return;
-
-        int input = m_periodSize; // always request 1 chunk of data from user
-        if (input > m_maxBufferSize)
-            input = m_maxBufferSize;
-
-        int audioBytesPulled = m_audioSource->read(m_audioBuffer, input);
-        Q_ASSERT(audioBytesPulled <= input);
+        int audioBytesPulled = m_audioSource->read(m_audioBuffer, writableSize);
         if (m_audioBuffer && audioBytesPulled > 0) {
-            if (audioBytesPulled > input) {
-                qWarning() << "QPulseAudioOutput::userFeed() - Invalid audio data size provided from user:"
-                           << audioBytesPulled << "should be less than" << input;
-                audioBytesPulled = input;
-            }
             qint64 bytesWritten = write(m_audioBuffer, audioBytesPulled);
             Q_ASSERT(bytesWritten == audioBytesPulled); //unfinished write should not happen since the data provided is less than writableSize
             Q_UNUSED(bytesWritten);
-
-            if (chunks > 1) {
-                // PulseAudio needs more data. Ask for it immediately.
-                QMetaObject::invokeMethod(this, "userFeed", Qt::QueuedConnection);
-            }
         }
     }
 
@@ -683,19 +667,11 @@ qint64 PulseOutputPrivate::readData(char *data, qint64 len)
 
 qint64 PulseOutputPrivate::writeData(const char *data, qint64 len)
 {
-    int retry = 0;
     qint64 written = 0;
 
     if ((m_audioDevice->m_deviceState == QAudio::ActiveState
          || m_audioDevice->m_deviceState == QAudio::IdleState)) {
-         while(written < len) {
-            int chunk = m_audioDevice->write(data+written, (len-written));
-            if (chunk <= 0)
-                retry++;
-            written+=chunk;
-            if (retry > 10)
-                return written;
-        }
+        written = m_audioDevice->write(data, len);
     }
 
     return written;

@@ -96,11 +96,6 @@ private:
     bool open();
     void close();
 
-    void checkSurround();
-    bool surround40;
-    bool surround51;
-    bool surround71;
-
     QString device;
     QAudio::Mode mode;
     QAudioFormat nearest;

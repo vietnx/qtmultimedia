@@ -67,7 +67,7 @@ QAudioFormat QPulseAudioDeviceInfo::preferredFormat() const
 
 QString QPulseAudioDeviceInfo::deviceName() const
 {
-    return m_device;
+    return "Pulse - " + m_device;
 }
 
 QStringList QPulseAudioDeviceInfo::supportedCodecs()
@@ -77,7 +77,7 @@ QStringList QPulseAudioDeviceInfo::supportedCodecs()
 
 QList<int> QPulseAudioDeviceInfo::supportedSampleRates()
 {
-    return QList<int>() << 8000 << 11025 << 22050 << 44100 << 48000;
+    return QList<int>() << 8000 << 11025 << 22050 << 44100 << 48000 << 88200 << 96000 << 176400 << 192000;
 }
 
 QList<int> QPulseAudioDeviceInfo::supportedChannelCounts()

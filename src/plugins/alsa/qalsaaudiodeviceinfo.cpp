@@ -61,7 +61,7 @@ QAlsaAudioDeviceInfo::QAlsaAudioDeviceInfo(const QByteArray &dev, QAudio::Mode m
     device = QLatin1String(dev);
     this->mode = mode;
 
-    checkSurround();
+    updateLists();
 }
 
 QAlsaAudioDeviceInfo::~QAlsaAudioDeviceInfo()
@@ -101,42 +101,36 @@ QAudioFormat QAlsaAudioDeviceInfo::preferredFormat() const
 
 QString QAlsaAudioDeviceInfo::deviceName() const
 {
-    return device;
+    return "Alsa - " + device;
 }
 
 QStringList QAlsaAudioDeviceInfo::supportedCodecs()
 {
-    updateLists();
     return codecz;
 }
 
 QList<int> QAlsaAudioDeviceInfo::supportedSampleRates()
 {
-    updateLists();
     return sampleRatez;
 }
 
 QList<int> QAlsaAudioDeviceInfo::supportedChannelCounts()
 {
-    updateLists();
     return channelz;
 }
 
 QList<int> QAlsaAudioDeviceInfo::supportedSampleSizes()
 {
-    updateLists();
     return sizez;
 }
 
 QList<QAudioFormat::Endian> QAlsaAudioDeviceInfo::supportedByteOrders()
 {
-    updateLists();
     return byteOrderz;
 }
 
 QList<QAudioFormat::SampleType> QAlsaAudioDeviceInfo::supportedSampleTypes()
 {
-    updateLists();
     return typez;
 }
 
@@ -151,11 +145,14 @@ QByteArray QAlsaAudioDeviceInfo::defaultDevice(QAudio::Mode mode)
 
 bool QAlsaAudioDeviceInfo::open()
 {
+    qDebug()<<__func__;
     int err = 0;
     QString dev;
 
-    if (!availableDevices(mode).contains(device.toLocal8Bit()))
+    if (!availableDevices(mode).contains(device.toLocal8Bit())){
+        qCritical()<<__func__<<"device"<<device<<"is not available";
         return false;
+    }
 
 #if SND_LIB_VERSION < 0x1000e  // 1.0.14
     if (device.compare(QLatin1String("default")) != 0)
@@ -170,9 +167,11 @@ bool QAlsaAudioDeviceInfo::open()
         err=snd_pcm_open( &handle,dev.toLocal8Bit().constData(),SND_PCM_STREAM_CAPTURE,0);
     }
     if(err < 0) {
+        qCritical()<<__func__<<"failed to open device"<<device<<"error:"<<snd_strerror(err);
         handle = 0;
         return false;
     }
+    snd_pcm_nonblock(handle, 0);
     return true;
 }
 
@@ -185,33 +184,45 @@ void QAlsaAudioDeviceInfo::close()
 
 bool QAlsaAudioDeviceInfo::testSettings(const QAudioFormat& format) const
 {
+    qDebug()<<__func__<< device << format;
     // Set nearest to closest settings that do work.
     // See if what is in settings will work (return value).
-    int err = -1;
+    int err = 0;
     snd_pcm_t* pcmHandle;
     snd_pcm_hw_params_t *params;
-    QString dev;
+
+    // For now, just accept only audio/pcm codec
+    if (!format.codec().startsWith(QLatin1String("audio/pcm"))){
+        return false;
+    }
+    bool openNeed = false;
+    if(!handle){
+        QString dev;
 
 #if SND_LIB_VERSION < 0x1000e  // 1.0.14
-    if (device.compare(QLatin1String("default")) != 0)
-        dev = deviceFromCardName(device);
-    else
-#endif
-        dev = device;
+        if (device.compare(QLatin1String("default")) != 0)
+            dev = deviceFromCardName(device);
+        else
+    #endif
+            dev = device;
 
-    snd_pcm_stream_t stream = mode == QAudio::AudioOutput
-                            ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE;
+        if(mode == QAudio::AudioOutput) {
+            err=snd_pcm_open( &pcmHandle, dev.toLocal8Bit().constData(), SND_PCM_STREAM_PLAYBACK, 0);
+        } else {
+            err=snd_pcm_open( &pcmHandle, dev.toLocal8Bit().constData(), SND_PCM_STREAM_CAPTURE, 0);
+        }
+        if(err < 0) {
+            return false;
+        }
+        snd_pcm_nonblock(pcmHandle, 0);
+        openNeed = true;
+    }
+    else{
+        pcmHandle = handle;
+    }
 
-    if (snd_pcm_open(&pcmHandle, dev.toLocal8Bit().constData(), stream, 0) < 0)
-        return false;
-
-    snd_pcm_nonblock(pcmHandle, 0);
     snd_pcm_hw_params_alloca(&params);
     snd_pcm_hw_params_any(pcmHandle, params);
-
-    // set the values!
-    snd_pcm_hw_params_set_channels(pcmHandle, params, format.channelCount());
-    snd_pcm_hw_params_set_rate(pcmHandle, params, format.sampleRate(), 0);
 
     snd_pcm_format_t pcmFormat = SND_PCM_FORMAT_UNKNOWN;
     switch (format.sampleSize()) {
@@ -230,6 +241,24 @@ bool QAlsaAudioDeviceInfo::testSettings(const QAudioFormat& format) const
                       ? SND_PCM_FORMAT_U16_LE : SND_PCM_FORMAT_U16_BE;
         }
         break;
+    case 20:
+        if (format.sampleType() == QAudioFormat::SignedInt) {
+            pcmFormat = format.byteOrder() == QAudioFormat::LittleEndian
+                      ? SND_PCM_FORMAT_S20_3LE : SND_PCM_FORMAT_S20_3BE;
+        } else if (format.sampleType() == QAudioFormat::UnSignedInt) {
+            pcmFormat = format.byteOrder() == QAudioFormat::LittleEndian
+                      ? SND_PCM_FORMAT_U20_3LE : SND_PCM_FORMAT_U20_3BE;
+        }
+        break;
+    case 24:
+        if (format.sampleType() == QAudioFormat::SignedInt) {
+            pcmFormat = format.byteOrder() == QAudioFormat::LittleEndian
+                      ? SND_PCM_FORMAT_S24_3LE : SND_PCM_FORMAT_S24_3BE;
+        } else if (format.sampleType() == QAudioFormat::UnSignedInt) {
+            pcmFormat = format.byteOrder() == QAudioFormat::LittleEndian
+                      ? SND_PCM_FORMAT_U24_3LE : SND_PCM_FORMAT_U24_3BE;
+        }
+        break;
     case 32:
         if (format.sampleType() == QAudioFormat::SignedInt) {
             pcmFormat = format.byteOrder() == QAudioFormat::LittleEndian
@@ -243,38 +272,42 @@ bool QAlsaAudioDeviceInfo::testSettings(const QAudioFormat& format) const
         }
     }
 
-    if (pcmFormat != SND_PCM_FORMAT_UNKNOWN)
-        err = snd_pcm_hw_params_set_format(pcmHandle, params, pcmFormat);
+    if(pcmFormat == SND_PCM_FORMAT_UNKNOWN){
+        if(openNeed){
+            snd_pcm_close(pcmHandle);
+        }
+        return false;
+    }
 
-    // For now, just accept only audio/pcm codec
-    if (!format.codec().startsWith(QLatin1String("audio/pcm")))
-        err = -1;
+    err = snd_pcm_hw_params_test_format(pcmHandle, params, pcmFormat);
+    if(err < 0){
+        qDebug() << __func__ << device << "This format is not supported" << format.sampleType() << format.sampleSize();
+    }
 
-    if (err >= 0 && format.channelCount() != -1) {
+    if (err >= 0 && format.channelCount() > 0) {
         err = snd_pcm_hw_params_test_channels(pcmHandle, params, format.channelCount());
-        if (err >= 0)
-            err = snd_pcm_hw_params_set_channels(pcmHandle, params, format.channelCount());
+    }
+    if(err < 0){
+        qDebug() << __func__ << device <<"This channel count is not supported" << format.channelCount();
     }
 
     if (err >= 0 && format.sampleRate() != -1) {
         err = snd_pcm_hw_params_test_rate(pcmHandle, params, format.sampleRate(), 0);
-        if (err >= 0)
-            err = snd_pcm_hw_params_set_rate(pcmHandle, params, format.sampleRate(), 0);
+    }
+    if(err < 0){
+        qDebug() << __func__ << device <<"This sample rate is not supported" << format.sampleRate();
     }
 
-    if (err >= 0 && pcmFormat != SND_PCM_FORMAT_UNKNOWN)
-        err = snd_pcm_hw_params_set_format(pcmHandle, params, pcmFormat);
-
-    if (err >= 0)
-        err = snd_pcm_hw_params(pcmHandle, params);
-
-    snd_pcm_close(pcmHandle);
+    if(openNeed){
+        snd_pcm_close(pcmHandle);
+    }
 
     return (err == 0);
 }
 
 void QAlsaAudioDeviceInfo::updateLists()
 {
+    qDebug() << __func__;
     // redo all lists based on current settings
     sampleRatez.clear();
     channelz.clear();
@@ -282,36 +315,59 @@ void QAlsaAudioDeviceInfo::updateLists()
     byteOrderz.clear();
     typez.clear();
     codecz.clear();
+    codecz.append(QLatin1String("audio/pcm"));
+    byteOrderz.append(QAudioFormat::LittleEndian);
+    byteOrderz.append(QAudioFormat::BigEndian);
 
     if(!handle)
         open();
 
     if(!handle)
         return;
-
-    for(int i=0; i<(int)MAX_SAMPLE_RATES; i++) {
-        //if(snd_pcm_hw_params_test_rate(handle, params, SAMPLE_RATES[i], dir) == 0)
-        sampleRatez.append(SAMPLE_RATES[i]);
+    QAudioFormat referenceFormat = preferredFormat();
+    const int sizes[] = {16, 20, 24, 32};
+    referenceFormat.setSampleType(QAudioFormat::SignedInt);
+    for (int s : sizes) {
+        QAudioFormat f = referenceFormat;
+        f.setSampleSize(s);
+        if (isFormatSupported(f)){
+            sizez.append(s);
+        }
     }
-    channelz.append(1);
-    channelz.append(2);
-    if (surround40) channelz.append(4);
-    if (surround51) channelz.append(6);
-    if (surround71) channelz.append(8);
-    sizez.append(8);
-    sizez.append(16);
-    sizez.append(32);
-    byteOrderz.append(QAudioFormat::LittleEndian);
-    byteOrderz.append(QAudioFormat::BigEndian);
-    typez.append(QAudioFormat::SignedInt);
-    typez.append(QAudioFormat::UnSignedInt);
-    typez.append(QAudioFormat::Float);
-    codecz.append(QLatin1String("audio/pcm"));
+    if(!sizez.isEmpty()){
+        referenceFormat.setSampleSize(sizez.first());
+        typez.append(QAudioFormat::SignedInt);
+    }
+
+    const int rates[] = {32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
+    for (int rate : rates) {
+        QAudioFormat f = referenceFormat;
+        f.setSampleRate(rate);
+        if (isFormatSupported(f))
+            sampleRatez.append(rate);
+    }
+
+    for (int i = 1; i <= 8; ++i) {
+        QAudioFormat f = referenceFormat;
+        f.setChannelCount(i);
+        if (isFormatSupported(f))
+            channelz.append(i);
+    }
+
+    referenceFormat.setSampleType(QAudioFormat::UnSignedInt);
+    if (isFormatSupported(referenceFormat))
+        typez.append(QAudioFormat::UnSignedInt);
+
+    referenceFormat.setSampleType(QAudioFormat::Float);
+    referenceFormat.setSampleSize(32);
+    if (isFormatSupported(referenceFormat))
+        typez.append(QAudioFormat::Float);
     close();
 }
 
 QList<QByteArray> QAlsaAudioDeviceInfo::availableDevices(QAudio::Mode mode)
 {
+    qDebug() << __func__;
     QList<QByteArray> devices;
     bool hasDefault = false;
 
@@ -323,7 +379,7 @@ QList<QByteArray> QAlsaAudioDeviceInfo::availableDevices(QAudio::Mode mode)
     char *name, *descr, *io;
 
     if(snd_device_name_hint(-1, "pcm", &hints) < 0) {
-        qWarning() << "no alsa devices available";
+        qWarning() << __func__ << "no alsa devices available";
         return devices;
     }
     n = hints;
@@ -340,7 +396,7 @@ QList<QByteArray> QAlsaAudioDeviceInfo::availableDevices(QAudio::Mode mode)
             descr = snd_device_name_get_hint(*n, "DESC");
             io = snd_device_name_get_hint(*n, "IOID");
 
-            if ((descr != NULL) && ((io == NULL) || (io == filter))) {
+            if ((descr != NULL) && ((io == NULL) || (io == filter)) && (qstrncmp(name, "hw:", 3) == 0 || qstrncmp(name, "sysdefault:", 11) == 0)) {
                 devices.append(name);
                 if (strcmp(name, "default") == 0)
                     hasDefault = true;
@@ -367,48 +423,8 @@ QList<QByteArray> QAlsaAudioDeviceInfo::availableDevices(QAudio::Mode mode)
 
     if (!hasDefault && devices.size() > 0)
         devices.prepend("default");
-
+    qDebug()<<__func__<<"available devices:"<<devices;
     return devices;
-}
-
-void QAlsaAudioDeviceInfo::checkSurround()
-{
-    surround40 = false;
-    surround51 = false;
-    surround71 = false;
-
-    void **hints, **n;
-    char *name, *descr, *io;
-
-    if(snd_device_name_hint(-1, "pcm", &hints) < 0)
-        return;
-
-    n = hints;
-
-    while (*n != NULL) {
-        name = snd_device_name_get_hint(*n, "NAME");
-        descr = snd_device_name_get_hint(*n, "DESC");
-        io = snd_device_name_get_hint(*n, "IOID");
-        if((name != NULL) && (descr != NULL)) {
-            QString deviceName = QLatin1String(name);
-            if (mode == QAudio::AudioOutput) {
-                if(deviceName.contains(QLatin1String("surround40")))
-                    surround40 = true;
-                if(deviceName.contains(QLatin1String("surround51")))
-                    surround51 = true;
-                if(deviceName.contains(QLatin1String("surround71")))
-                    surround71 = true;
-            }
-        }
-        if(name != NULL)
-            free(name);
-        if(descr != NULL)
-            free(descr);
-        if(io != NULL)
-            free(io);
-        ++n;
-    }
-    snd_device_name_free_hint(hints);
 }
 
 QString QAlsaAudioDeviceInfo::deviceFromCardName(const QString &card)

@@ -54,6 +54,7 @@
 #include "qalsaaudiooutput.h"
 #include "qalsaaudiodeviceinfo.h"
 #include <QLoggingCategory>
+#include <QThread>
 
 QT_BEGIN_NAMESPACE
 
@@ -87,11 +88,13 @@ QAlsaAudioOutput::QAlsaAudioOutput(const QByteArray &device)
     m_device = device;
 
     timer = new QTimer(this);
+    timer->setTimerType(Qt::PreciseTimer);
     connect(timer,SIGNAL(timeout()),SLOT(userFeed()));
 }
 
 QAlsaAudioOutput::~QAlsaAudioOutput()
 {
+    qDebug()<<QThread::currentThreadId()<<__FUNCTION__;
     close();
     disconnect(timer, SIGNAL(timeout()));
     QCoreApplication::processEvents();
@@ -181,17 +184,29 @@ int QAlsaAudioOutput::setFormat()
             else
                 pcmformat = SND_PCM_FORMAT_U16_BE;
         }
+    } else if(settings.sampleSize() == 20) {
+        if(settings.sampleType() == QAudioFormat::SignedInt) {
+            if(settings.byteOrder() == QAudioFormat::LittleEndian)
+                pcmformat = SND_PCM_FORMAT_S20_3LE;
+            else
+                pcmformat = SND_PCM_FORMAT_S20_3BE;
+        } else if(settings.sampleType() == QAudioFormat::UnSignedInt) {
+            if(settings.byteOrder() == QAudioFormat::LittleEndian)
+                pcmformat = SND_PCM_FORMAT_U20_3LE;
+            else
+                pcmformat = SND_PCM_FORMAT_U20_3BE;
+        }
     } else if(settings.sampleSize() == 24) {
         if(settings.sampleType() == QAudioFormat::SignedInt) {
             if(settings.byteOrder() == QAudioFormat::LittleEndian)
-                pcmformat = SND_PCM_FORMAT_S24_LE;
+                pcmformat = SND_PCM_FORMAT_S24_3LE;
             else
-                pcmformat = SND_PCM_FORMAT_S24_BE;
+                pcmformat = SND_PCM_FORMAT_S24_3BE;
         } else if(settings.sampleType() == QAudioFormat::UnSignedInt) {
             if(settings.byteOrder() == QAudioFormat::LittleEndian)
-                pcmformat = SND_PCM_FORMAT_U24_LE;
+                pcmformat = SND_PCM_FORMAT_U24_3LE;
             else
-                pcmformat = SND_PCM_FORMAT_U24_BE;
+                pcmformat = SND_PCM_FORMAT_U24_3BE;
         }
     } else if(settings.sampleSize() == 32) {
         if(settings.sampleType() == QAudioFormat::SignedInt) {
@@ -333,6 +348,7 @@ bool QAlsaAudioOutput::open()
             count++;
     }
     if (( err < 0)||(handle == 0)) {
+        qCritical()<<__func__<<"failed to open playback device"<<dev<<"snd_pcm_open return error:"<<snd_strerror(err);
         errorState = QAudio::OpenError;
         emit errorChanged(errorState);
         deviceState = QAudio::StoppedState;
@@ -405,22 +421,19 @@ bool QAlsaAudioOutput::open()
             fatal = true;
             errMessage = QString::fromLatin1("QAudioOutput: buffer/period min and max: err = %1").arg(err);
         } else {
-            static unsigned user_buffer_time = qEnvironmentVariableIntValue("QT_ALSA_OUTPUT_BUFFER_TIME");
-            static unsigned user_period_time = qEnvironmentVariableIntValue("QT_ALSA_OUTPUT_PERIOD_TIME");
+            chunks = 4;
+            buffer_time = settings.durationForBytes(buffer_size)*2;
+            period_time = buffer_time / chunks;
+            buffer_time = period_time * chunks;
             const bool outOfRange = maxBufferTime < buffer_time || buffer_time < minBufferTime || maxPeriodTime < period_time || minPeriodTime > period_time;
-            if (outOfRange || user_period_time || user_buffer_time) {
-                period_time = user_period_time ? user_period_time : minPeriodTime;
-                if (!user_buffer_time) {
-                    chunks = maxBufferTime / period_time;
-                    buffer_time = period_time * chunks;
-                } else {
-                    buffer_time = user_buffer_time;
-                    chunks = buffer_time / period_time;
-                }
+            if (outOfRange) {
+                period_time = minPeriodTime;
+                chunks = maxBufferTime / period_time;
+                buffer_time = period_time * chunks;
             }
-            qCDebug(lcAlsaOutput) << "buffer time: [" << minBufferTime << "-" << maxBufferTime << "] =" << buffer_time;
-            qCDebug(lcAlsaOutput) << "period time: [" << minPeriodTime << "-" << maxPeriodTime << "] =" << period_time;
-            qCDebug(lcAlsaOutput) << "chunks =" << chunks;
+            qCInfo(lcAlsaOutput) << "buffer time: [" << minBufferTime << "-" << maxBufferTime << "] =" << buffer_time;
+            qCInfo(lcAlsaOutput) << "period time: [" << minPeriodTime << "-" << maxPeriodTime << "] =" << period_time;
+            qCInfo(lcAlsaOutput) << "chunks =" << chunks;
         }
     }
     if ( !fatal ) {
@@ -707,7 +720,7 @@ bool QAlsaAudioOutput::deviceReady()
 
         if(l > 0) {
             // Got some data to output
-            if (deviceState != QAudio::ActiveState && deviceState != QAudio::IdleState)
+            if(deviceState != QAudio::ActiveState)
                 return true;
             qint64 bytesWritten = write(audioBuffer,l);
             if (bytesWritten != l)
