@@ -51,6 +51,8 @@
 #include <Audioclient.h>
 #include <mmdeviceapi.h>
 
+#define WASAPI_MODE AUDCLNT_SHAREMODE_SHARED
+
 struct IAudioClient;
 
 QT_BEGIN_NAMESPACE
@@ -134,8 +136,8 @@ private:
 
 namespace QWasapiUtils
 {
-    bool convertToNativeFormat(const QAudioFormat &qt, WAVEFORMATEX *native);
-    bool convertFromNativeFormat(const WAVEFORMATEX *native, QAudioFormat *qt);
+    bool convertToNativeFormat(const QAudioFormat &qt, WAVEFORMATEXTENSIBLE *native, bool oldFormat = false);
+    bool convertFromNativeFormat(const WAVEFORMATEXTENSIBLE *native, QAudioFormat *qt);
 
     QByteArray defaultDevice(QAudio::Mode mode);
     QList<QByteArray> availableDevices(QAudio::Mode mode);

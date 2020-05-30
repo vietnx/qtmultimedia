@@ -279,10 +279,12 @@ bool QWasapiAudioInput::initStart(bool pull)
     Q_ASSERT(m_interface);
 
     m_pullMode = pull;
-    WAVEFORMATEX nFmt;
-    WAVEFORMATEX closest;
-    WAVEFORMATEX *pClose = &closest;
+    WAVEFORMATEXTENSIBLE nFmt;
+    WAVEFORMATEXTENSIBLE closest;
+    WAVEFORMATEX *pClose = &closest.Format;
 
+    closest.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    closest.Format.cbSize = 22;
     if (!m_currentFormat.isValid() || !QWasapiUtils::convertToNativeFormat(m_currentFormat, &nFmt)) {
         m_currentError = QAudio::OpenError;
         emit errorChanged(m_currentError);
@@ -291,19 +293,19 @@ bool QWasapiAudioInput::initStart(bool pull)
 
     HRESULT hr;
 
-    hr = m_interface->m_client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &nFmt, &pClose);
+    hr = m_interface->m_client->IsFormatSupported(WASAPI_MODE, &nFmt.Format, &pClose);
     if (hr != S_OK) {
         m_currentError = QAudio::OpenError;
         emit errorChanged(m_currentError);
         return false;
     }
 
-    REFERENCE_TIME t = ((10000.0 * 10000 / nFmt.nSamplesPerSec * 1024) + 0.5);
+    REFERENCE_TIME t = ((10000.0 * 10000 / nFmt.Format.nSamplesPerSec * 1024) + 0.5);
     if (m_bufferBytes)
         t = m_currentFormat.durationForBytes(m_bufferBytes) * 10;
 
     const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    hr = m_interface->m_client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, t, 0, &nFmt, NULL);
+    hr = m_interface->m_client->Initialize(WASAPI_MODE, flags, t, 0, &nFmt.Format, NULL);
     EMIT_RETURN_FALSE_IF_FAILED("Could not initialize audio client.", QAudio::OpenError)
 
     hr = m_interface->m_client->GetService(IID_PPV_ARGS(&m_capture));

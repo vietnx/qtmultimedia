@@ -37,6 +37,7 @@
 **
 ****************************************************************************/
 
+#include <initguid.h>
 #include "qwasapiutils.h"
 
 #include <QtCore/QCoreApplication>
@@ -134,14 +135,15 @@ HRESULT AudioInterface::ActivateCompleted(IActivateAudioInterfaceAsyncOperation 
     }
 
     hr = aInterface->QueryInterface(IID_PPV_ARGS(&m_client));
+    aInterface->Release();
     if (FAILED(hr)) {
         qCDebug(lcMmAudioInterface) << __FUNCTION__ << "Could not access AudioClient interface.";
         m_currentState = Error;
         return hr;
     }
 
-    WAVEFORMATEX *format;
-    hr = m_client->GetMixFormat(&format);
+    WAVEFORMATEXTENSIBLE *format = nullptr;
+    hr = m_client->GetMixFormat((WAVEFORMATEX**)&format);
     if (FAILED(hr)) {
         qCDebug(lcMmAudioInterface) << __FUNCTION__ << "Could not get mix format.";
         m_currentState = Error;
@@ -149,12 +151,13 @@ HRESULT AudioInterface::ActivateCompleted(IActivateAudioInterfaceAsyncOperation 
     }
 
     QWasapiUtils::convertFromNativeFormat(format, &m_mixFormat);
+    CoTaskMemFree(format);
 
     m_currentState = Activated;
     return S_OK;
 }
 
-bool QWasapiUtils::convertToNativeFormat(const QAudioFormat &qt, WAVEFORMATEX *native)
+bool QWasapiUtils::convertToNativeFormat(const QAudioFormat &qt, WAVEFORMATEXTENSIBLE *native, bool oldFormat)
 {
     if (!native
             || !qt.isValid()
@@ -166,32 +169,73 @@ bool QWasapiUtils::convertToNativeFormat(const QAudioFormat &qt, WAVEFORMATEX *n
         return false;
     }
 
-    native->nSamplesPerSec = qt.sampleRate();
-    native->wBitsPerSample = qt.sampleSize();
-    native->nChannels = qt.channelCount();
-    native->nBlockAlign = (native->wBitsPerSample * native->nChannels) / 8;
-    native->nAvgBytesPerSec = native->nBlockAlign * native->nSamplesPerSec;
-    native->cbSize = 0;
-
-    if (qt.sampleType() == QAudioFormat::Float)
-        native->wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
-    else
-        native->wFormatTag = WAVE_FORMAT_PCM;
+    native->Format.nSamplesPerSec = qt.sampleRate();
+    native->Format.wBitsPerSample = qt.sampleSize();
+    native->Format.nChannels = qt.channelCount();
+    if(oldFormat){
+        native->Format.cbSize = 0;
+        native->Format.wFormatTag = (qt.sampleType() == QAudioFormat::Float) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+    }
+    else{
+        native->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        native->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        if(qt.sampleSize() == 20){
+            native->Format.wBitsPerSample = 24;
+        }
+        // wave format extension
+        native->Samples.wValidBitsPerSample = qt.sampleSize();
+        switch (qt.channelCount()) {
+        case 1:
+            native->dwChannelMask = KSAUDIO_SPEAKER_MONO;
+            break;
+        case 2:
+            native->dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+        case 3:
+            native->dwChannelMask = KSAUDIO_SPEAKER_2POINT1;
+        case 4:
+            native->dwChannelMask = KSAUDIO_SPEAKER_QUAD;
+        case 5:
+            native->dwChannelMask = KSAUDIO_SPEAKER_5POINT0;
+        case 6:
+            native->dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
+        case 7:
+            native->dwChannelMask = KSAUDIO_SPEAKER_7POINT0;
+        case 8:
+            native->dwChannelMask = KSAUDIO_SPEAKER_7POINT1;
+        default:
+            break;
+        }
+        if (qt.sampleType() == QAudioFormat::Float){
+            native->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        }
+        else{
+            native->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+        }
+    }
+    native->Format.nBlockAlign = (native->Format.wBitsPerSample * native->Format.nChannels) / 8;
+    native->Format.nAvgBytesPerSec = native->Format.nBlockAlign * native->Format.nSamplesPerSec;
 
     return true;
 }
 
-bool QWasapiUtils::convertFromNativeFormat(const WAVEFORMATEX *native, QAudioFormat *qt)
+bool QWasapiUtils::convertFromNativeFormat(const WAVEFORMATEXTENSIBLE *native, QAudioFormat *qt)
 {
     if (!native || !qt)
         return false;
 
     qt->setByteOrder(QAudioFormat::LittleEndian);
-    qt->setChannelCount(native->nChannels);
     qt->setCodec(QStringLiteral("audio/pcm"));
-    qt->setSampleRate(native->nSamplesPerSec);
-    qt->setSampleSize(native->wBitsPerSample);
-    qt->setSampleType(native->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? QAudioFormat::Float : QAudioFormat::SignedInt);
+    qt->setChannelCount(native->Format.nChannels);
+    qt->setSampleRate(native->Format.nSamplesPerSec);
+    if(native->Format.cbSize >= 22){
+        qCDebug(lcMmAudioInterface) << __FUNCTION__ << "extensible format cbSize ="<<native->Format.cbSize<<"format tag ="<<native->Format.wFormatTag;
+        qt->setSampleSize(native->Samples.wValidBitsPerSample);
+        qt->setSampleType(native->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT ? QAudioFormat::Float : QAudioFormat::SignedInt);
+    }
+    else{
+        qt->setSampleSize(native->Format.wBitsPerSample);
+        qt->setSampleType(native->Format.wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? QAudioFormat::Float : QAudioFormat::SignedInt);
+    }
 
     return true;
 }
@@ -280,7 +324,7 @@ QList<QByteArray> QWasapiUtils::availableDevices(QAudio::Mode mode)
             continue;
         }
         const wchar_t *nameWStr = hString.GetRawBuffer(&size);
-        const QString deviceName = QString::fromWCharArray(nameWStr, size);
+        const QString deviceName = ((WASAPI_MODE==AUDCLNT_SHAREMODE_SHARED)?QString("WASAPI shared - "):QString("WASAPI exclusive - ")) + QString::fromWCharArray(nameWStr, size);
 
         hr = item->get_Id(hString.GetAddressOf());
         if (FAILED(hr)) {

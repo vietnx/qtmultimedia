@@ -115,6 +115,7 @@ private:
     QWasapiProcessThread *m_eventThread;
     QAtomicInt m_processing;
     QIODevice *m_eventDevice;
+    HANDLE m_hTask;
 };
 
 QT_END_NAMESPACE

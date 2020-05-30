@@ -54,7 +54,21 @@ QWasapiAudioDeviceInfo::QWasapiAudioDeviceInfo(QByteArray dev, QAudio::Mode mode
 
     QAudioFormat referenceFormat = m_interface->m_mixFormat;
 
-    const int rates[] = {8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 192000};
+    const int sizes[] = {16, 20, 24, 32};
+    referenceFormat.setSampleType(QAudioFormat::SignedInt);
+    for (int s : sizes) {
+        QAudioFormat f = referenceFormat;
+        f.setSampleSize(s);
+        if (isFormatSupported(f)){
+            m_sampleSizes.append(s);
+        }
+    }
+    if(!m_sampleSizes.isEmpty()){
+        referenceFormat.setSampleSize(m_sampleSizes.first());
+        m_sampleTypes.append(QAudioFormat::SignedInt);
+    }
+
+    const int rates[] = {32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000};
     for (int rate : rates) {
         QAudioFormat f = referenceFormat;
         f.setSampleRate(rate);
@@ -62,26 +76,15 @@ QWasapiAudioDeviceInfo::QWasapiAudioDeviceInfo(QByteArray dev, QAudio::Mode mode
             m_sampleRates.append(rate);
     }
 
-    for (int i = 1; i <= 18; ++i) {
+    for (int i = 1; i <= 8; ++i) {
         QAudioFormat f = referenceFormat;
         f.setChannelCount(i);
         if (isFormatSupported(f))
             m_channelCounts.append(i);
     }
 
-    const int sizes[] = {8, 12, 16, 20, 24, 32, 64};
-    for (int s : sizes) {
-        QAudioFormat f = referenceFormat;
-        f.setSampleSize(s);
-        if (isFormatSupported(f))
-            m_sampleSizes.append(s);
-    }
-
-    referenceFormat.setSampleType(QAudioFormat::SignedInt);
-    if (isFormatSupported(referenceFormat))
-        m_sampleTypes.append(QAudioFormat::SignedInt);
-
     referenceFormat.setSampleType(QAudioFormat::Float);
+    referenceFormat.setSampleSize(32);
     if (isFormatSupported(referenceFormat))
         m_sampleTypes.append(QAudioFormat::Float);
 }
@@ -95,22 +98,29 @@ bool QWasapiAudioDeviceInfo::isFormatSupported(const QAudioFormat& format) const
 {
     qCDebug(lcMmDeviceInfo) << __FUNCTION__ << format;
 
-    WAVEFORMATEX nfmt;
+    WAVEFORMATEXTENSIBLE nfmt;
+    ZeroMemory(&nfmt, sizeof(WAVEFORMATEXTENSIBLE));
     if (!QWasapiUtils::convertToNativeFormat(format, &nfmt))
         return false;
 
-    WAVEFORMATEX closest;
-    WAVEFORMATEX *pClosest = &closest;
+    WAVEFORMATEXTENSIBLE closest;
+    WAVEFORMATEX *pClosest = &closest.Format;
+    closest.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    closest.Format.cbSize = 22;
     HRESULT hr;
-    hr = m_interface->m_client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &nfmt, &pClosest);
+    hr = m_interface->m_client->IsFormatSupported(WASAPI_MODE, &nfmt.Format, &pClosest);
 
+    if (hr == S_OK) // S_FALSE is inside SUCCEEDED()
+        return true;
+    ZeroMemory(&nfmt, sizeof(WAVEFORMATEXTENSIBLE));
+    if (!QWasapiUtils::convertToNativeFormat(format, &nfmt, true))
+        return false;
+    hr = m_interface->m_client->IsFormatSupported(WASAPI_MODE, &nfmt.Format, &pClosest);
     if (hr == S_OK) // S_FALSE is inside SUCCEEDED()
         return true;
 
     if (lcMmDeviceInfo().isDebugEnabled()) {
-        QAudioFormat f;
-        QWasapiUtils::convertFromNativeFormat(pClosest, &f);
-        qCDebug(lcMmDeviceInfo) << __FUNCTION__ << hr << "Closest match is:" << f;
+        qCDebug(lcMmDeviceInfo) << __FUNCTION__ << "failed with error code:" << hr;
     }
 
     return false;

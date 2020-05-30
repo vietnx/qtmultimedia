@@ -45,6 +45,7 @@
 #include <QtCore/QTimer>
 
 #include <Audioclient.h>
+#include <avrt.h>
 #include <functional>
 
 using namespace Microsoft::WRL;
@@ -74,6 +75,7 @@ WasapiOutputDevicePrivate::WasapiOutputDevicePrivate(QWasapiAudioOutput* output)
     qCDebug(lcMmAudioOutput) << __FUNCTION__;
 
     m_timer.setSingleShot(true);
+    m_timer.setTimerType(Qt::PreciseTimer);
     connect(&m_timer, &QTimer::timeout, [=](){
         if (m_output->m_currentState == QAudio::ActiveState) {
             m_output->m_currentState = QAudio::IdleState;
@@ -109,13 +111,15 @@ qint64 WasapiOutputDevicePrivate::writeData(const char* data, qint64 len)
     const quint32 channelCount = m_output->m_currentFormat.channelCount();
     const quint32 sampleBytes = m_output->m_currentFormat.sampleSize() / 8;
     const quint32 freeBytes = static_cast<quint32>(m_output->bytesFree());
-    const quint32 bytesToWrite = qMin(freeBytes, static_cast<quint32>(len));
+    quint32 bytesToWrite = qMin(freeBytes, static_cast<quint32>(len));
     const quint32 framesToWrite = bytesToWrite / (channelCount * sampleBytes);
+    bytesToWrite = framesToWrite * channelCount * sampleBytes;
 
     BYTE *buffer;
     HRESULT hr;
     hr = m_output->m_renderer->GetBuffer(framesToWrite, &buffer);
     if (hr != S_OK) {
+        qCDebug(lcMmAudioOutput) << __FUNCTION__ << "GetBuffer() failed with error code hr ="<<hr;
         m_output->m_currentError = QAudio::UnderrunError;
         QMetaObject::invokeMethod(m_output, "errorChanged", Qt::QueuedConnection,
                                   Q_ARG(QAudio::Error, QAudio::UnderrunError));
@@ -165,6 +169,7 @@ QWasapiAudioOutput::QWasapiAudioOutput(const QByteArray &device)
     , m_bufferFrames(0)
     , m_bufferBytes(4096)
     , m_eventThread(0)
+    , m_hTask(NULL)
 {
     qCDebug(lcMmAudioOutput) << __FUNCTION__ << device;
 }
@@ -179,12 +184,14 @@ void QWasapiAudioOutput::setVolume(qreal vol)
 {
     qCDebug(lcMmAudioOutput) << __FUNCTION__ << vol;
     m_volumeCache = vol;
-    if (m_volumeControl) {
-        quint32 channelCount;
-        HRESULT hr = m_volumeControl->GetChannelCount(&channelCount);
-        for (quint32 i = 0; i < channelCount; ++i) {
-            hr = m_volumeControl->SetChannelVolume(i, vol);
-            RETURN_VOID_IF_FAILED("Could not set audio volume.");
+    if(WASAPI_MODE == AUDCLNT_SHAREMODE_SHARED){
+        if (m_volumeControl) {
+            quint32 channelCount;
+            HRESULT hr = m_volumeControl->GetChannelCount(&channelCount);
+            for (quint32 i = 0; i < channelCount; ++i) {
+                hr = m_volumeControl->SetChannelVolume(i, vol);
+                RETURN_VOID_IF_FAILED("Could not set audio volume.");
+            }
         }
     }
 }
@@ -199,14 +206,22 @@ void QWasapiAudioOutput::process()
 {
     qCDebug(lcMmAudioOutput) << __FUNCTION__;
     DWORD waitRet;
+    DWORD taskIndex = 0;
+    m_hTask = AvSetMmThreadCharacteristics(TEXT("Pro Audio"), &taskIndex);
+    if (m_hTask == NULL) {
+        m_currentError = QAudio::OpenError;
+        emit errorChanged(m_currentError);
+        return;
+    }
 
     m_processing = true;
     do {
         waitRet = WaitForSingleObjectEx(m_event, 2000, FALSE);
         if (waitRet != WAIT_OBJECT_0) {
-            qFatal("Returned while waiting for event.");
-            return;
+            qCritical()<< __FUNCTION__ << "Returned while waiting for event.";
+            break;
         }
+        ResetEvent(m_event);
 
         QMutexLocker locker(&m_mutex);
 
@@ -214,6 +229,10 @@ void QWasapiAudioOutput::process()
             break;
         QMetaObject::invokeMethod(this, "processBuffer", Qt::QueuedConnection);
     } while (m_processing);
+
+    if (m_hTask) {
+        AvRevertMmThreadCharacteristics(m_hTask);
+    }
 }
 
 void QWasapiAudioOutput::processBuffer()
@@ -225,23 +244,30 @@ void QWasapiAudioOutput::processBuffer()
     BYTE* buffer;
     HRESULT hr;
 
-    quint32 paddingFrames;
-    hr = m_interface->m_client->GetCurrentPadding(&paddingFrames);
+    quint32 availableFrames = m_bufferFrames;
 
-    const quint32 availableFrames = m_bufferFrames - paddingFrames;
+    if(WASAPI_MODE == AUDCLNT_SHAREMODE_SHARED){
+        quint32 paddingFrames;
+        hr = m_interface->m_client->GetCurrentPadding(&paddingFrames);
+        if(FAILED(hr))
+            qCDebug(lcMmAudioOutput) <<  "GetCurrentPadding() failed hr ="<<hr;
+        availableFrames = m_bufferFrames - paddingFrames;
+    }
+
     hr = m_renderer->GetBuffer(availableFrames, &buffer);
     if (hr != S_OK) {
+        qCCritical(lcMmAudioOutput) <<  "GetBuffer() failed hr ="<<hr;
         m_currentError = QAudio::UnderrunError;
         emit errorChanged(m_currentError);
         // Also Error Buffers need to be released
         hr = m_renderer->ReleaseBuffer(availableFrames, 0);
-        ResetEvent(m_event);
         return;
     }
 
-    const quint32 readBytes = availableFrames * channelCount * sampleBytes;
-    const qint64 read = m_eventDevice->read((char*)buffer, readBytes);
-    if (read < static_cast<qint64>(readBytes)) {
+    quint32 readBytes = availableFrames * channelCount * sampleBytes;
+    qint64 read = m_eventDevice->read((char*)buffer, readBytes);
+    if (read > 0 && (read < static_cast<qint64>(readBytes))) {
+        qCDebug(lcMmAudioOutput) <<  "Read return" << read <<"bytes";
         // Fill the rest of the buffer with zero to avoid audio glitches
         if (m_currentError != QAudio::UnderrunError) {
             m_currentError = QAudio::UnderrunError;
@@ -256,7 +282,6 @@ void QWasapiAudioOutput::processBuffer()
     hr = m_renderer->ReleaseBuffer(availableFrames, 0);
     if (hr != S_OK)
         qFatal("Could not release buffer");
-    ResetEvent(m_event);
 
     if (m_interval && m_openTime.elapsed() - m_openTimeOffset > m_interval) {
         emit notify();
@@ -278,9 +303,9 @@ bool QWasapiAudioOutput::initStart(bool pull)
     Q_ASSERT(m_interface);
 
     m_pullMode = pull;
-    WAVEFORMATEX nFmt;
-    WAVEFORMATEX closest;
-    WAVEFORMATEX *pClose = &closest;
+    WAVEFORMATEXTENSIBLE nFmt;
+    WAVEFORMATEXTENSIBLE closest;
+    WAVEFORMATEX *pClose = &closest.Format;
 
     if (!m_currentFormat.isValid() || !QWasapiUtils::convertToNativeFormat(m_currentFormat, &nFmt)) {
         m_currentError = QAudio::OpenError;
@@ -290,34 +315,81 @@ bool QWasapiAudioOutput::initStart(bool pull)
 
     HRESULT hr;
 
-    hr = m_interface->m_client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, &nFmt, &pClose);
+    hr = m_interface->m_client->IsFormatSupported(WASAPI_MODE, &nFmt.Format, &pClose);
+    if (hr != S_OK) {
+        QWasapiUtils::convertToNativeFormat(m_currentFormat, &nFmt, true);
+        hr = m_interface->m_client->IsFormatSupported(WASAPI_MODE, &nFmt.Format, &pClose);
+        if(hr != S_OK){
+            m_currentError = QAudio::OpenError;
+            emit errorChanged(m_currentError);
+            return false;
+        }
+    }
+
+    REFERENCE_TIME devicePeriod = 0;
+    REFERENCE_TIME miniumDevicePeriod;
+    if(WASAPI_MODE == AUDCLNT_SHAREMODE_EXCLUSIVE){
+        hr = m_interface->m_client->GetDevicePeriod(NULL, &miniumDevicePeriod);
+    }
+    else {
+        hr = m_interface->m_client->GetDevicePeriod(&miniumDevicePeriod, NULL);
+    }
     if (hr != S_OK) {
         m_currentError = QAudio::OpenError;
         emit errorChanged(m_currentError);
         return false;
     }
-
-    REFERENCE_TIME t = ((10000.0 * 10000 / nFmt.nSamplesPerSec * 1024) + 0.5);
-    if (m_bufferBytes)
-        t = m_currentFormat.durationForBytes(m_bufferBytes) * 100;
-
+    if (m_bufferBytes) {
+        devicePeriod = m_currentFormat.durationForBytes(m_bufferBytes) * 10;
+    }
+    if(devicePeriod < miniumDevicePeriod){
+        devicePeriod = miniumDevicePeriod;
+    }
     DWORD flags = pull ? AUDCLNT_STREAMFLAGS_EVENTCALLBACK : 0;
-    hr = m_interface->m_client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, t, 0, &nFmt, NULL);
+    hr = m_interface->m_client->Initialize(WASAPI_MODE,
+                                           flags,
+                                           (WASAPI_MODE == AUDCLNT_SHAREMODE_SHARED && flags == AUDCLNT_STREAMFLAGS_EVENTCALLBACK) ? 0 : devicePeriod,
+                                           (WASAPI_MODE == AUDCLNT_SHAREMODE_EXCLUSIVE) ? devicePeriod : 0,
+                                           &nFmt.Format,
+                                           NULL);
+    if(hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED){
+        hr = m_interface->m_client->GetBufferSize(&m_bufferFrames);
+        EMIT_RETURN_FALSE_IF_FAILED("Could not access buffer size.", QAudio::OpenError)
+        devicePeriod = (REFERENCE_TIME)
+                        ((10000.0 * 1000 / nFmt.Format.nSamplesPerSec * m_bufferFrames) + 0.5);
+        m_interface = QWasapiUtils::createOrGetInterface(m_deviceName, QAudio::AudioOutput);
+        Q_ASSERT(m_interface);
+        hr = m_interface->m_client->Initialize(WASAPI_MODE, flags, devicePeriod, devicePeriod, &nFmt.Format, nullptr);
+    }
     EMIT_RETURN_FALSE_IF_FAILED("Could not initialize audio client.", QAudio::OpenError)
 
     hr = m_interface->m_client->GetService(IID_PPV_ARGS(&m_renderer));
     EMIT_RETURN_FALSE_IF_FAILED("Could not acquire render service.", QAudio::OpenError)
 
-    hr = m_interface->m_client->GetService(IID_PPV_ARGS(&m_volumeControl));
-    if (FAILED(hr))
-        qCDebug(lcMmAudioOutput) << "Could not acquire volume control.";
+    if(WASAPI_MODE == AUDCLNT_SHAREMODE_SHARED){
+        hr = m_interface->m_client->GetService(IID_PPV_ARGS(&m_volumeControl));
+        if (FAILED(hr))
+            qCDebug(lcMmAudioOutput) << "Could not acquire volume control.";
+    }
 
     hr = m_interface->m_client->GetBufferSize(&m_bufferFrames);
     EMIT_RETURN_FALSE_IF_FAILED("Could not access buffer size.", QAudio::OpenError)
-
+    qCDebug(lcMmAudioOutput) << "Buffer frame count:"<<m_bufferFrames;
+    if(flags == AUDCLNT_STREAMFLAGS_EVENTCALLBACK)
+    {
+        BYTE* data = NULL;
+        hr = m_renderer->GetBuffer(m_bufferFrames, &data);
+        if (FAILED(hr))
+            qCDebug(lcMmAudioOutput) << "Could not acquire render buffer.";
+        quint32 readBytes = (m_bufferFrames * m_currentFormat.channelCount() * m_currentFormat.sampleSize()) / 8;
+        qint64 read = m_eventDevice->read((char*)data, readBytes);
+        hr = m_renderer->ReleaseBuffer(m_bufferFrames, (read < static_cast<qint64>(readBytes)) ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+        if (FAILED(hr))
+            qCDebug(lcMmAudioOutput) << "Could not release render buffer.";
+    }
     if (m_pullMode) {
         m_eventThread = new QWasapiProcessThread(this);
-        m_event = CreateEventEx(NULL, NULL, 0, EVENT_ALL_ACCESS);
+        m_event = CreateEventEx(NULL, NULL, CREATE_EVENT_MANUAL_RESET, SYNCHRONIZE | EVENT_MODIFY_STATE);
         m_eventThread->m_event = m_event;
 
         hr = m_interface->m_client->SetEventHandle(m_event);
@@ -325,13 +397,14 @@ bool QWasapiAudioOutput::initStart(bool pull)
     } else {
         m_eventDevice = new WasapiOutputDevicePrivate(this);
         m_eventDevice->open(QIODevice::WriteOnly|QIODevice::Unbuffered);
+        DWORD taskIndex = 0;
+        m_hTask = AvSetMmThreadCharacteristics(TEXT("Pro Audio"), &taskIndex);
+        if (m_hTask == NULL) {
+            m_currentError = QAudio::OpenError;
+            emit errorChanged(m_currentError);
+            return false;
+        }
     }
-    // Send some initial data, do not exit on failure, latest in process
-    // those an error will be caught
-    BYTE *pdata = nullptr;
-    hr = m_renderer->GetBuffer(m_bufferFrames, &pdata);
-    hr = m_renderer->ReleaseBuffer(m_bufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
-
     hr = m_interface->m_client->Start();
     EMIT_RETURN_FALSE_IF_FAILED("Could not start audio render client.", QAudio::OpenError)
 
@@ -356,11 +429,15 @@ QAudio::State QWasapiAudioOutput::state() const
 void QWasapiAudioOutput::start(QIODevice *device)
 {
     qCDebug(lcMmAudioOutput) << __FUNCTION__ << device;
-    if (!initStart(true)) {
-        qCDebug(lcMmAudioOutput) << __FUNCTION__ << "failed";
+    if(!device || !device->isOpen()){
+        qCCritical(lcMmAudioOutput) << __FUNCTION__ << "Device is null or not openned";
         return;
     }
     m_eventDevice = device;
+    if (!initStart(true)) {
+        qCritical(lcMmAudioOutput) << __FUNCTION__ << "failed";
+        return;
+    }
 
     m_mutex.lock();
     m_currentState = QAudio::ActiveState;
@@ -393,9 +470,11 @@ void QWasapiAudioOutput::stop()
         return;
 
     if (!m_pullMode) {
-        HRESULT hr;
-        hr = m_interface->m_client->Stop();
-        hr = m_interface->m_client->Reset();
+        m_eventDevice->deleteLater();
+        m_eventDevice = nullptr;
+        if (m_hTask) {
+            AvRevertMmThreadCharacteristics(m_hTask);
+        }
     }
 
     m_mutex.lock();
@@ -409,11 +488,6 @@ void QWasapiAudioOutput::stop()
         emit errorChanged(m_currentError);
     }
 
-    HRESULT hr = m_interface->m_client->Stop();
-    if (m_currentState == QAudio::StoppedState) {
-        hr = m_interface->m_client->Reset();
-    }
-
     if (m_eventThread) {
         SetEvent(m_eventThread->m_event);
         while (m_eventThread->isRunning())
@@ -421,6 +495,8 @@ void QWasapiAudioOutput::stop()
         m_eventThread->deleteLater();
         m_eventThread = 0;
     }
+    m_interface->m_client->Stop();
+    m_interface->m_client->Reset();
 }
 
 int QWasapiAudioOutput::bytesFree() const
@@ -444,12 +520,12 @@ int QWasapiAudioOutput::bytesFree() const
 int QWasapiAudioOutput::periodSize() const
 {
     qCDebug(lcMmAudioOutput) << __FUNCTION__;
-    REFERENCE_TIME defaultDevicePeriod;
-    HRESULT hr = m_interface->m_client->GetDevicePeriod(&defaultDevicePeriod, NULL);
+    REFERENCE_TIME miniumDevicePeriod;
+    HRESULT hr = m_interface->m_client->GetDevicePeriod((WASAPI_MODE == AUDCLNT_SHAREMODE_EXCLUSIVE) ? NULL : &miniumDevicePeriod, (WASAPI_MODE == AUDCLNT_SHAREMODE_EXCLUSIVE) ? &miniumDevicePeriod : NULL);
     if (FAILED(hr))
         return 0;
     const QAudioFormat f = m_currentFormat.isValid() ? m_currentFormat : m_interface->m_mixFormat;
-    const int res = m_currentFormat.bytesForDuration(defaultDevicePeriod / 10);
+    const int res = f.bytesForDuration(miniumDevicePeriod / 10);
     return res;
 }
 
@@ -501,7 +577,22 @@ void QWasapiAudioOutput::resume()
     if (m_currentState != QAudio::SuspendedState)
         return;
 
-    HRESULT hr = m_interface->m_client->Start();
+    HRESULT hr;
+    if(m_pullMode){
+        BYTE* data = NULL;
+        hr = m_renderer->GetBuffer(m_bufferFrames, &data);
+        if (SUCCEEDED(hr)){
+            quint32 readBytes = (m_bufferFrames * m_currentFormat.channelCount() * m_currentFormat.sampleSize()) / 8;
+            qint64 read = m_eventDevice->read((char*)data, readBytes);
+            hr = m_renderer->ReleaseBuffer(m_bufferFrames, (read < static_cast<qint64>(readBytes)) ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+            if (FAILED(hr))
+                qCDebug(lcMmAudioOutput) << "Could not release render buffer.";
+        }
+        else{
+            qCDebug(lcMmAudioOutput) << "Could not acquire render buffer.";
+        }
+    }
+    hr = m_interface->m_client->Start();
     EMIT_RETURN_VOID_IF_FAILED("Could not start audio render client.", QAudio::FatalError)
 
     m_mutex.lock();
